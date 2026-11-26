@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AsciiCam
+Comment=Live camera feed as ASCII art in the terminal
+Exec=/usr/bin/asciicam
+Icon=share/images/asciicam.png
+Terminal=true
+Categories=AudioVideo;
+StartupNotify=false

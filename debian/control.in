@@ -1,0 +1,13 @@
+Package: asciicam
+Version: @VERSION@
+Section: video
+Priority: optional
+Architecture: all
+Depends: python3, python3-numpy, python3-picamera2
+Maintainer: ErnestG4 <ErnestG4@users.noreply.github.com>
+Description: Live camera to ASCII art in the terminal
+ Renders the camera feed as ASCII art in any terminal, on the device
+ LCD console or over SSH; the grid follows the terminal size. Multiple
+ character ramps, truecolour mode, edge detection, flipping, gamma
+ control and frame export to text. Works with the built-in CSI camera
+ (picamera2), any V4L2 webcam (OpenCV), or a synthetic test pattern.

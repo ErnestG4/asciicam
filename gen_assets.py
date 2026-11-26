@@ -43,15 +43,18 @@ def cells(frame, st):
     lum = small @ cam.LUMA
     if st["edges"]:
         lum = cam.edges(lum)
-    lum = cam.stretch(lum, dict(st)) ** st["gamma"]
+    sst = dict(st)
+    lum = cam.stretch(lum, sst) ** st["gamma"]
     if st["invert"]:
         lum = 1.0 - lum
     ramp = cam.RAMPS[st["ramp"]]
     idx = np.minimum((lum * len(ramp)).astype(int), len(ramp) - 1)
     chars = np.array(list(ramp))[idx]
-    cell_lum = np.maximum(small @ cam.LUMA, 1.0)[..., None]
-    rgb = np.clip(small * (lum[..., None] * 255.0 / cell_lum),
-                  0, 255).astype(int) & 0xF0
+    # same global stretch as the glyphs, snapped to the xterm cube levels
+    rgb01 = np.clip((small - sst["lo"]) / max(sst["hi"] - sst["lo"], 1e-6),
+                    0.0, 1.0)
+    cube = (rgb01 * 5.999).astype(int)
+    rgb = np.array([0, 95, 135, 175, 215, 255])[cube]
     return chars, rgb
 
 

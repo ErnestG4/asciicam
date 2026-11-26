@@ -23,7 +23,7 @@ import tty
 
 import numpy as np
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 RAMPS = [
     " .:-=+*#%@",
@@ -182,22 +182,35 @@ def render(frame, cols, rows, st):
     plain = ["".join(r) for r in chars]
     if not st["colour"]:
         return plain, plain
-    # Colour is the cell's averaged hue with its brightness replaced by the
-    # same stretched luminance that picked the glyph, so colour and glyph
-    # density always agree; quantised so flat areas form long runs.
-    cell_lum = np.maximum(small @ LUMA, 1.0)[..., None]
-    rgb = np.clip(small * (lum[..., None] * 255.0 / cell_lum),
-                  0, 255).astype(np.uint8)
-    rgb &= 0xF0
+    # Colour: the averaged cell through the SAME global contrast stretch as
+    # the glyphs - one linear map, no per-cell gain, so dark noise can't
+    # blow up into saturated primaries. Default output is the xterm 6x6x6
+    # cube: escapes are half the bytes of truecolour and quantising to six
+    # levels makes long equal-colour runs, which is what slow terminals
+    # (the LCD console) actually need.
+    lo, hi = st["lo"], st["hi"]
+    rgb = np.clip((small - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
     out = []
+    if st["truecolor"]:
+        q = (rgb * 255).astype(np.uint8) & 0xE0
+        for y in range(rows):
+            row, cells = q[y], plain[y]
+            cut = np.flatnonzero(np.r_[True, (row[1:] != row[:-1]).any(1)])
+            parts = ["\x1b[38;2;%d;%d;%dm%s"
+                     % (row[s, 0], row[s, 1], row[s, 2],
+                        cells[s:(cut[i + 1] if i + 1 < len(cut) else cols)])
+                     for i, s in enumerate(cut)]
+            out.append("".join(parts) + "\x1b[0m")
+        return out, plain
+    cube = (rgb * 5.999).astype(np.uint8)
+    n256 = 16 + 36 * cube[..., 0] + 6 * cube[..., 1] + cube[..., 2]
     for y in range(rows):
-        row, cells = rgb[y], plain[y]
-        cut = np.flatnonzero(np.r_[True, (row[1:] != row[:-1]).any(1)])
-        parts = []
-        for i, s in enumerate(cut):
-            e = cut[i + 1] if i + 1 < len(cut) else cols
-            parts.append("\x1b[38;2;%d;%d;%dm%s"
-                         % (row[s, 0], row[s, 1], row[s, 2], cells[s:e]))
+        row, cells = n256[y], plain[y]
+        cut = np.flatnonzero(np.r_[True, row[1:] != row[:-1]])
+        parts = ["\x1b[38;5;%dm%s"
+                 % (row[s],
+                    cells[s:(cut[i + 1] if i + 1 < len(cut) else cols)])
+                 for i, s in enumerate(cut)]
         out.append("".join(parts) + "\x1b[0m")
     return out, plain
 
@@ -219,17 +232,21 @@ def main():
     ap.add_argument("--fps", type=float, default=15.0)
     ap.add_argument("--frames", type=int, default=0,
                     help="stop after N frames (0 = run until q)")
+    ap.add_argument("--truecolor", action="store_true",
+                    help="24-bit colour escapes (default: xterm 256-colour)")
     args = ap.parse_args()
     size = tuple(int(v) for v in args.size.lower().split("x"))
 
     src, name = open_source(args.source, size)
     # the Cardputer Zero camera module is mounted rotated 180 degrees
     st = dict(ramp=0, invert=False, colour=False, edges=False,
-              mirror=(name == "picam"), vflip=(name == "picam"), gamma=1.0)
+              mirror=(name == "picam"), vflip=(name == "picam"),
+              truecolor=args.truecolor, gamma=1.0)
     interactive = sys.stdin.isatty()
     old = termios.tcgetattr(sys.stdin) if interactive else None
     out = sys.stdout
-    msg, n, fps, last = "", 0, 0.0, time.time()
+    msg, n, fps = "", 0, 0.0
+    win_n, win_t0 = 0, time.time()
     try:
         if interactive:
             tty.setcbreak(sys.stdin.fileno())
@@ -272,11 +289,16 @@ def main():
                 msg = "saved " + fn
 
             n += 1
+            win_n += 1
             if args.frames and n >= args.frames:
                 break
+            # frames actually delivered per wall-clock second: a blocked
+            # terminal write slows this honestly, where averaging
+            # instantaneous rates inflated it
             now = time.time()
-            fps = 0.9 * fps + 0.1 / max(now - last, 1e-6) if fps else 1 / max(now - last, 1e-6)
-            last = now
+            if now - win_t0 >= 1.0:
+                fps = win_n / (now - win_t0)
+                win_n, win_t0 = 0, now
             time.sleep(max(0.0, 1.0 / args.fps - (time.time() - t0)))
     except KeyboardInterrupt:
         pass

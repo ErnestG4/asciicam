@@ -23,7 +23,7 @@ import tty
 
 import numpy as np
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 RAMPS = [
     " .:-=+*#%@",
@@ -164,12 +164,23 @@ def stretch(lum, st):
 
 
 def render(frame, cols, rows, st):
+    """One terminal update string (a diff against the previous frame) plus
+    the plain-text grid. The slow link is the terminal painting cells, not
+    this code, so only cells whose glyph or colour actually changed are
+    rewritten; a temporal EMA on the cell grid keeps sensor noise from
+    touching cells that haven't really changed."""
     img = crop_to_aspect(frame, cols / (rows * CELL_ASPECT))
     small = area_resize(img, cols, rows)
     if st["vflip"]:
         small = small[::-1]
     if st["mirror"]:
         small = small[:, ::-1]
+    acc = st.get("acc")
+    if acc is None or acc.shape != small.shape:
+        st["acc"] = small
+    else:
+        st["acc"] = 0.65 * acc + 0.35 * small
+    small = st["acc"]
     lum = small @ LUMA
     if st["edges"]:
         lum = edges(lum)
@@ -180,39 +191,61 @@ def render(frame, cols, rows, st):
     idx = np.minimum((lum * len(ramp)).astype(int), len(ramp) - 1)
     chars = RAMP_CHARS[st["ramp"]][idx]
     plain = ["".join(r) for r in chars]
-    if not st["colour"]:
-        return plain, plain
-    # Colour: the averaged cell through the SAME global contrast stretch as
-    # the glyphs - one linear map, no per-cell gain, so dark noise can't
-    # blow up into saturated primaries. Default output is the xterm 6x6x6
-    # cube: escapes are half the bytes of truecolour and quantising to six
-    # levels makes long equal-colour runs, which is what slow terminals
-    # (the LCD console) actually need.
-    lo, hi = st["lo"], st["hi"]
-    rgb = np.clip((small - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-    out = []
-    if st["truecolor"]:
-        q = (rgb * 255).astype(np.uint8) & 0xE0
-        for y in range(rows):
-            row, cells = q[y], plain[y]
-            cut = np.flatnonzero(np.r_[True, (row[1:] != row[:-1]).any(1)])
-            parts = ["\x1b[38;2;%d;%d;%dm%s"
-                     % (row[s, 0], row[s, 1], row[s, 2],
-                        cells[s:(cut[i + 1] if i + 1 < len(cut) else cols)])
-                     for i, s in enumerate(cut)]
-            out.append("".join(parts) + "\x1b[0m")
-        return out, plain
-    cube = (rgb * 5.999).astype(np.uint8)
-    n256 = 16 + 36 * cube[..., 0] + 6 * cube[..., 1] + cube[..., 2]
-    for y in range(rows):
-        row, cells = n256[y], plain[y]
-        cut = np.flatnonzero(np.r_[True, row[1:] != row[:-1]])
-        parts = ["\x1b[38;5;%dm%s"
-                 % (row[s],
-                    cells[s:(cut[i + 1] if i + 1 < len(cut) else cols)])
-                 for i, s in enumerate(cut)]
-        out.append("".join(parts) + "\x1b[0m")
-    return out, plain
+
+    if st["colour"]:
+        # colour = the averaged cell through the same global contrast
+        # stretch as the glyphs: one linear map, no per-cell gain
+        lo, hi = st["lo"], st["hi"]
+        rgb = np.clip((small - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        if st["truecolor"]:
+            q = (rgb * 255).astype(np.int32) & 0xE0
+            col = (q[..., 0] << 16) | (q[..., 1] << 8) | q[..., 2]
+
+            def sgr(v):
+                return "\x1b[38;2;%d;%d;%dm" % (v >> 16, v >> 8 & 255,
+                                                v & 255)
+        else:
+            cube = (rgb * 5.999).astype(np.int32)
+            col = 16 + 36 * cube[..., 0] + 6 * cube[..., 1] + cube[..., 2]
+
+            def sgr(v):
+                return "\x1b[38;5;%dm" % v
+    else:
+        col = None
+
+    pch, pcol = st.get("pchars"), st.get("pcol")
+    full = (pch is None or pch.shape != chars.shape
+            or (col is None) != (pcol is None)
+            or st.get("frame_i", 0) % 120 == 0)
+    if full:
+        changed = np.ones(chars.shape, bool)
+    else:
+        changed = chars != pch
+        if col is not None:
+            changed |= col != pcol
+    st["pchars"], st["pcol"], st["full"] = chars, col, full
+
+    parts = ["\x1b[2J"] if full else []
+    for y in np.flatnonzero(changed.any(1)):
+        xs = np.flatnonzero(changed[y])
+        # segments of changed cells; gaps of a few unchanged cells are
+        # cheaper to rewrite than a fresh cursor move
+        brk = np.flatnonzero(np.diff(xs) > 4)
+        for g0, g1 in zip(np.r_[0, brk + 1], np.r_[brk, len(xs) - 1]):
+            s, e = xs[g0], xs[g1] + 1
+            parts.append("\x1b[%d;%dH" % (y + 1, s + 1))
+            if col is None:
+                parts.append(plain[y][s:e])
+            else:
+                row = col[y]
+                cut = np.flatnonzero(
+                    np.r_[True, row[s + 1:e] != row[s:e - 1]]) + s
+                for i, cs in enumerate(cut):
+                    ce = cut[i + 1] if i + 1 < len(cut) else e
+                    parts.append(sgr(row[cs]) + plain[y][cs:ce])
+    if col is not None and len(parts) > (1 if full else 0):
+        parts.append("\x1b[0m")
+    return "".join(parts), plain
 
 
 # ---------- terminal ----------
@@ -251,16 +284,21 @@ def main():
         if interactive:
             tty.setcbreak(sys.stdin.fileno())
         out.write("\x1b[?25l\x1b[2J")
+        last_status = None
         while True:
             t0 = time.time()
             cols, lines = shutil.get_terminal_size((53, 17))
             rows = max(1, lines - 1)
-            shown, plain = render(src.read(), cols, rows, st)
+            st["frame_i"] = n
+            upd, plain = render(src.read(), cols, rows, st)
             status = (" %s %4.1ffps ramp%d g%.1f %s" % (
-                name, fps, st["ramp"], st["gamma"], msg))[:cols]
-            out.write("\x1b[H" + "\n".join(shown) + "\n\x1b[7m"
-                      + status.ljust(cols) + "\x1b[0m")
-            out.flush()
+                name, fps, st["ramp"], st["gamma"], msg))[:cols].ljust(cols)
+            if status != last_status or st["full"]:
+                upd += "\x1b[%d;1H\x1b[0;7m%s\x1b[0m" % (rows + 1, status)
+                last_status = status
+            if upd:
+                out.write(upd)
+                out.flush()
 
             k = key_pressed() if interactive else None
             if k == "q":
@@ -287,6 +325,10 @@ def main():
                 with open(fn, "w", encoding="utf-8") as f:
                     f.write("\n".join(plain) + "\n")
                 msg = "saved " + fn
+            if k and k != "s":
+                st["pchars"] = None  # mode changed: full repaint
+                if k in "fm":
+                    st["acc"] = None  # geometry changed: restart denoise
 
             n += 1
             win_n += 1

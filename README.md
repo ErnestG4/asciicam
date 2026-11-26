@@ -13,6 +13,9 @@ works on the device's own LCD console and over SSH alike.
   the glyph so colour and character density always agree
 - Edge-detection mode, inversion, X/Y flip, live gamma control
 - Flicker-free contrast stretch (temporally smoothed percentile bounds)
+- Differential screen updates: a temporal denoise pass keeps camera noise
+  from touching stable cells, and only changed cells are rewritten — slow
+  terminals (like the device LCD console) stay at full speed
 - Save any frame as a plain-text file
 - Sources: Raspberry Pi camera (picamera2), any V4L2/USB webcam (OpenCV),
   or a synthetic test pattern — auto-detected

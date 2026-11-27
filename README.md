@@ -40,7 +40,13 @@ source corrects for that automatically.
 
 ```
 asciicam [--source auto|picam|cv|test] [--size WxH] [--fps N] [--frames N]
+         [--truecolor] [--fb]
 ```
+
+`--fb` draws straight to the LCD framebuffer (`/dev/fb_lcd`) with a
+prebaked glyph atlas — no terminal in the middle, so colour and block
+ramps cost exactly the same as plain ASCII. The launcher menu entry uses
+it; terminal mode remains the default for SSH sessions.
 
 ## Install
 

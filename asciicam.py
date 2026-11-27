@@ -23,7 +23,7 @@ import tty
 
 import numpy as np
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 RAMPS = [
     " .:-=+*#%@",
@@ -163,12 +163,10 @@ def stretch(lum, st):
     return np.clip((lum - lo) / (hi - lo), 0, 1)
 
 
-def render(frame, cols, rows, st):
-    """One terminal update string (a diff against the previous frame) plus
-    the plain-text grid. The slow link is the terminal painting cells, not
-    this code, so only cells whose glyph or colour actually changed are
-    rewritten; a temporal EMA on the cell grid keeps sensor noise from
-    touching cells that haven't really changed."""
+def cell_grid(frame, cols, rows, st):
+    """Front half of the pipeline, shared by every output: cell averages,
+    stretched luminance and the glyph index per cell. A temporal EMA on
+    the cell grid keeps sensor noise from touching stable cells."""
     img = crop_to_aspect(frame, cols / (rows * CELL_ASPECT))
     small = area_resize(img, cols, rows)
     if st["vflip"]:
@@ -189,14 +187,29 @@ def render(frame, cols, rows, st):
         lum = 1.0 - lum
     ramp = RAMPS[st["ramp"]]
     idx = np.minimum((lum * len(ramp)).astype(int), len(ramp) - 1)
+    return small, idx
+
+
+def cell_colour(small, st):
+    """Cell colours 0..1, through the same global contrast stretch as the
+    glyphs: one linear map, no per-cell gain. None when colour is off."""
+    if not st["colour"]:
+        return None
+    lo, hi = st["lo"], st["hi"]
+    return np.clip((small - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+
+
+def render(frame, cols, rows, st):
+    """One terminal update string (a diff against the previous frame) plus
+    the plain-text grid. The slow link is the terminal painting cells, not
+    this code, so only cells whose glyph or colour actually changed are
+    rewritten."""
+    small, idx = cell_grid(frame, cols, rows, st)
     chars = RAMP_CHARS[st["ramp"]][idx]
     plain = ["".join(r) for r in chars]
 
-    if st["colour"]:
-        # colour = the averaged cell through the same global contrast
-        # stretch as the glyphs: one linear map, no per-cell gain
-        lo, hi = st["lo"], st["hi"]
-        rgb = np.clip((small - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    rgb = cell_colour(small, st)
+    if rgb is not None:
         if st["truecolor"]:
             q = (rgb * 255).astype(np.int32) & 0xE0
             col = (q[..., 0] << 16) | (q[..., 1] << 8) | q[..., 2]
@@ -248,6 +261,83 @@ def render(frame, cols, rows, st):
     return "".join(parts), plain
 
 
+# ---------- framebuffer output ----------
+
+class FbOut:
+    """Draw the grid straight to the LCD framebuffer (RGB565), the same
+    path the launcher UI uses - no terminal in the middle, so colour and
+    block ramps cost the same as plain ASCII."""
+    CW, CH = 6, 10
+
+    def __init__(self, path="/dev/fb_lcd"):
+        base = "/sys/class/graphics/" + os.path.basename(
+            os.path.realpath(path))
+        self.w, self.h = (int(v) for v in
+                          open(base + "/virtual_size").read().split(","))
+        bpp = int(open(base + "/bits_per_pixel").read())
+        if bpp != 16:
+            raise RuntimeError("fb is %d bpp, expected 16 (RGB565)" % bpp)
+        self.f = open(path, "r+b", buffering=0)
+        self.cols = self.w // self.CW
+        self.rows = self.h // self.CH - 1  # bottom row is the status bar
+        self.ramp_ids = {}
+        self._atlas()
+
+    def _atlas(self):
+        from PIL import Image, ImageDraw, ImageFont
+        chars = [chr(i) for i in range(32, 127)] + list("░▒▓█")
+        self.glyph_id = {c: i for i, c in enumerate(chars)}
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/"
+                                  "DejaVuSansMono.ttf", self.CH)
+        a = np.zeros((len(chars), self.CH, self.CW), np.float32)
+        for i, c in enumerate(chars):
+            im = Image.new("L", (self.CW, self.CH), 0)
+            ImageDraw.Draw(im).text((0, -1), c, font=font, fill=255)
+            a[i] = np.asarray(im, np.float32) / 255.0
+        # the shade blocks read better as flat coverage at 6x10 px
+        for c, lvl in zip("░▒▓█", (0.25, 0.5, 0.75, 1.0)):
+            a[self.glyph_id[c]] = lvl
+        self.atlas = a
+
+    def _ids(self, ramp):
+        ids = self.ramp_ids.get(ramp)
+        if ids is None:
+            ids = np.array([self.glyph_id.get(c, 0) for c in ramp])
+            self.ramp_ids[ramp] = ids
+        return ids
+
+    def show(self, idx, col, ramp, status):
+        rows, cols = idx.shape
+        mask = self.atlas[self._ids(ramp)[idx]]      # rows,cols,CH,CW
+        if col is None:
+            col = np.full(idx.shape + (3,), 230.0, np.float32)
+        px = mask[..., None] * col[:, :, None, None, :]
+        px = px.transpose(0, 2, 1, 3, 4).reshape(rows * self.CH,
+                                                 cols * self.CW, 3)
+        frame = np.zeros((self.h, self.w, 3), np.float32)
+        frame[:px.shape[0], :px.shape[1]] = px
+        self._status(frame, status)
+        f16 = frame.astype(np.uint16)
+        buf = (((f16[..., 0] >> 3) << 11) | ((f16[..., 1] >> 2) << 5)
+               | (f16[..., 2] >> 3))
+        self.f.seek(0)
+        self.f.write(buf.tobytes())
+
+    def _status(self, frame, text):
+        y0 = self.rows * self.CH
+        frame[y0:, :] = 205.0
+        ids = [self.glyph_id.get(c, 0) for c in text[: self.cols]]
+        if not ids:
+            return
+        strip = self.atlas[np.array(ids)].transpose(1, 0, 2).reshape(
+            self.CH, -1)[:, : self.w, None]
+        frame[y0:y0 + self.CH, : strip.shape[1]] = (
+            205.0 * (1 - strip) + 20.0 * strip)
+
+    def close(self):
+        self.f.close()
+
+
 # ---------- terminal ----------
 
 def key_pressed():
@@ -267,6 +357,9 @@ def main():
                     help="stop after N frames (0 = run until q)")
     ap.add_argument("--truecolor", action="store_true",
                     help="24-bit colour escapes (default: xterm 256-colour)")
+    ap.add_argument("--fb", action="store_true",
+                    help="draw straight to the LCD framebuffer "
+                         "(/dev/fb_lcd) instead of the terminal")
     args = ap.parse_args()
     size = tuple(int(v) for v in args.size.lower().split("x"))
 
@@ -275,6 +368,13 @@ def main():
     st = dict(ramp=0, invert=False, colour=False, edges=False,
               mirror=(name == "picam"), vflip=(name == "picam"),
               truecolor=args.truecolor, gamma=1.0)
+    fb = None
+    if args.fb:
+        try:
+            fb = FbOut()
+        except Exception as e:
+            src.close()
+            sys.exit("--fb unavailable: %s" % e)
     interactive = sys.stdin.isatty()
     old = termios.tcgetattr(sys.stdin) if interactive else None
     out = sys.stdout
@@ -287,18 +387,30 @@ def main():
         last_status = None
         while True:
             t0 = time.time()
-            cols, lines = shutil.get_terminal_size((53, 17))
-            rows = max(1, lines - 1)
+            if fb is not None:
+                cols, rows = fb.cols, fb.rows
+            else:
+                cols, lines = shutil.get_terminal_size((53, 17))
+                rows = max(1, lines - 1)
             st["frame_i"] = n
-            upd, plain = render(src.read(), cols, rows, st)
             status = (" %s %4.1ffps ramp%d g%.1f %s" % (
                 name, fps, st["ramp"], st["gamma"], msg))[:cols].ljust(cols)
-            if status != last_status or st["full"]:
-                upd += "\x1b[%d;1H\x1b[0;7m%s\x1b[0m" % (rows + 1, status)
-                last_status = status
-            if upd:
-                out.write(upd)
-                out.flush()
+            if fb is not None:
+                small, idx = cell_grid(src.read(), cols, rows, st)
+                rgb = cell_colour(small, st)
+                fb.show(idx, None if rgb is None else rgb * 255.0,
+                        RAMPS[st["ramp"]], status)
+                plain = None  # built on demand when saving
+            else:
+                upd, plain = render(src.read(), cols, rows, st)
+                idx = None
+                if status != last_status or st["full"]:
+                    upd += "\x1b[%d;1H\x1b[0;7m%s\x1b[0m" % (rows + 1,
+                                                            status)
+                    last_status = status
+                if upd:
+                    out.write(upd)
+                    out.flush()
 
             k = key_pressed() if interactive else None
             if k == "q":
@@ -321,6 +433,9 @@ def main():
             elif k == "]":
                 st["gamma"] = min(3.0, round(st["gamma"] + 0.1, 1))
             elif k == "s":
+                if plain is None:
+                    plain = ["".join(r)
+                             for r in RAMP_CHARS[st["ramp"]][idx]]
                 fn = time.strftime("ascii-%Y%m%d-%H%M%S.txt")
                 with open(fn, "w", encoding="utf-8") as f:
                     f.write("\n".join(plain) + "\n")
@@ -346,6 +461,8 @@ def main():
         pass
     finally:
         src.close()
+        if fb is not None:
+            fb.close()
         if old is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
         out.write("\x1b[0m\x1b[?25h\n")

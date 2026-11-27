@@ -31,7 +31,15 @@ works on the device's own LCD console and over SSH alike.
 | `e` | edge mode |
 | `f` / `m` | flip Y / mirror X |
 | `[` / `]` | gamma down / up |
-| `s` | save frame to text file |
+| `s` | snapshot: `.txt` + coloured `.ans` + rendered `.png` + raw `.jpg` |
+| `v` | record / stop an asciinema `.cast` |
+
+Captures land in `~/Pictures/asciicam/`. Replay a recording with
+`asciinema play file.cast`, or render it to video (needs ffmpeg):
+
+```
+asciicam --render rec-20261127-093000.cast   # writes .mp4 next to it
+```
 
 On the Cardputer Zero the camera module is mounted rotated 180°; the picam
 source corrects for that automatically.

@@ -10,10 +10,16 @@ Sources (tried in order unless --source is given):
 
 Keys:
   q quit      r next ramp     i invert      c colour on/off
-  e edges     m mirror        f flip Y      [ ] gamma     s save frame
+  e edges     m mirror        f flip Y      [ ] gamma
+  s snapshot (.txt + .ans + rendered .png + raw .jpg)
+  v record / stop (asciinema .cast; render to video with --render)
+
+Captures land in ~/Pictures/asciicam/.
 """
 import argparse
+import json
 import os
+import re
 import select
 import shutil
 import sys
@@ -23,7 +29,7 @@ import tty
 
 import numpy as np
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 RAMPS = [
     " .:-=+*#%@",
@@ -199,30 +205,52 @@ def cell_colour(small, st):
     return np.clip((small - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
 
 
-def render(frame, cols, rows, st):
+def colour_codes(rgb, truecolor):
+    """Per-cell colour keys plus the escape builder for them."""
+    if truecolor:
+        q = (rgb * 255).astype(np.int32) & 0xE0
+        col = (q[..., 0] << 16) | (q[..., 1] << 8) | q[..., 2]
+
+        def sgr(v):
+            return "\x1b[38;2;%d;%d;%dm" % (v >> 16, v >> 8 & 255, v & 255)
+    else:
+        cube = (rgb * 5.999).astype(np.int32)
+        col = 16 + 36 * cube[..., 0] + 6 * cube[..., 1] + cube[..., 2]
+
+        def sgr(v):
+            return "\x1b[38;5;%dm" % v
+    return col, sgr
+
+
+def ansi_full(idx, rgb, st):
+    """One whole frame as ANSI art: rows joined by CRLF, colour as run-
+    length escapes. Used for .ans snapshots and .cast recording frames."""
+    chars = RAMP_CHARS[st["ramp"]][idx]
+    plain = ["".join(r) for r in chars]
+    if rgb is None:
+        return "\r\n".join(plain)
+    col, sgr = colour_codes(rgb, st["truecolor"])
+    rows, cols = idx.shape
+    out = []
+    for y in range(rows):
+        row = col[y]
+        cut = np.flatnonzero(np.r_[True, row[1:] != row[:-1]])
+        out.append("".join(
+            sgr(row[s]) + plain[y][s:(cut[i + 1] if i + 1 < len(cut)
+                                      else cols)]
+            for i, s in enumerate(cut)))
+    return "\r\n".join(out) + "\x1b[0m"
+
+
+def render(idx, rgb, cols, rows, st):
     """One terminal update string (a diff against the previous frame) plus
     the plain-text grid. The slow link is the terminal painting cells, not
     this code, so only cells whose glyph or colour actually changed are
     rewritten."""
-    small, idx = cell_grid(frame, cols, rows, st)
     chars = RAMP_CHARS[st["ramp"]][idx]
     plain = ["".join(r) for r in chars]
-
-    rgb = cell_colour(small, st)
     if rgb is not None:
-        if st["truecolor"]:
-            q = (rgb * 255).astype(np.int32) & 0xE0
-            col = (q[..., 0] << 16) | (q[..., 1] << 8) | q[..., 2]
-
-            def sgr(v):
-                return "\x1b[38;2;%d;%d;%dm" % (v >> 16, v >> 8 & 255,
-                                                v & 255)
-        else:
-            cube = (rgb * 5.999).astype(np.int32)
-            col = 16 + 36 * cube[..., 0] + 6 * cube[..., 1] + cube[..., 2]
-
-            def sgr(v):
-                return "\x1b[38;5;%dm" % v
+        col, sgr = colour_codes(rgb, st["truecolor"])
     else:
         col = None
 
@@ -261,6 +289,49 @@ def render(frame, cols, rows, st):
     return "".join(parts), plain
 
 
+# ---------- glyph rasterizing ----------
+
+class GlyphAtlas:
+    """Antialiased glyph masks at one cell size, shared by the LCD
+    framebuffer output, PNG snapshots and cast-to-video rendering."""
+    CHARS = [chr(i) for i in range(32, 127)] + list("░▒▓█")
+    FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+
+    def __init__(self, cw, ch):
+        from PIL import Image, ImageDraw, ImageFont
+        self.cw, self.ch = cw, ch
+        self.glyph_id = {c: i for i, c in enumerate(self.CHARS)}
+        font = ImageFont.truetype(self.FONT, ch)
+        a = np.zeros((len(self.CHARS), ch, cw), np.float32)
+        for i, c in enumerate(self.CHARS):
+            im = Image.new("L", (cw, ch), 0)
+            ImageDraw.Draw(im).text((0, -1), c, font=font, fill=255)
+            a[i] = np.asarray(im, np.float32) / 255.0
+        # the shade blocks read better as flat coverage at small sizes
+        for c, lvl in zip("░▒▓█", (0.25, 0.5, 0.75, 1.0)):
+            a[self.glyph_id[c]] = lvl
+        self.a = a
+        self.ramp_ids = {}
+
+    def ids(self, ramp):
+        ids = self.ramp_ids.get(ramp)
+        if ids is None:
+            ids = np.array([self.glyph_id.get(c, 0) for c in ramp])
+            self.ramp_ids[ramp] = ids
+        return ids
+
+    def compose(self, gids, col):
+        """RGB float image of a glyph-id grid; col is per-cell RGB 0-255
+        or None for plain light-grey."""
+        rows, cols = gids.shape
+        mask = self.a[gids]                         # rows,cols,ch,cw
+        if col is None:
+            col = np.full(gids.shape + (3,), 230.0, np.float32)
+        px = mask[..., None] * col[:, :, None, None, :]
+        return px.transpose(0, 2, 1, 3, 4).reshape(rows * self.ch,
+                                                   cols * self.cw, 3)
+
+
 # ---------- framebuffer output ----------
 
 class FbOut:
@@ -280,40 +351,10 @@ class FbOut:
         self.f = open(path, "r+b", buffering=0)
         self.cols = self.w // self.CW
         self.rows = self.h // self.CH - 1  # bottom row is the status bar
-        self.ramp_ids = {}
-        self._atlas()
-
-    def _atlas(self):
-        from PIL import Image, ImageDraw, ImageFont
-        chars = [chr(i) for i in range(32, 127)] + list("░▒▓█")
-        self.glyph_id = {c: i for i, c in enumerate(chars)}
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/"
-                                  "DejaVuSansMono.ttf", self.CH)
-        a = np.zeros((len(chars), self.CH, self.CW), np.float32)
-        for i, c in enumerate(chars):
-            im = Image.new("L", (self.CW, self.CH), 0)
-            ImageDraw.Draw(im).text((0, -1), c, font=font, fill=255)
-            a[i] = np.asarray(im, np.float32) / 255.0
-        # the shade blocks read better as flat coverage at 6x10 px
-        for c, lvl in zip("░▒▓█", (0.25, 0.5, 0.75, 1.0)):
-            a[self.glyph_id[c]] = lvl
-        self.atlas = a
-
-    def _ids(self, ramp):
-        ids = self.ramp_ids.get(ramp)
-        if ids is None:
-            ids = np.array([self.glyph_id.get(c, 0) for c in ramp])
-            self.ramp_ids[ramp] = ids
-        return ids
+        self.atlas = GlyphAtlas(self.CW, self.CH)
 
     def show(self, idx, col, ramp, status):
-        rows, cols = idx.shape
-        mask = self.atlas[self._ids(ramp)[idx]]      # rows,cols,CH,CW
-        if col is None:
-            col = np.full(idx.shape + (3,), 230.0, np.float32)
-        px = mask[..., None] * col[:, :, None, None, :]
-        px = px.transpose(0, 2, 1, 3, 4).reshape(rows * self.CH,
-                                                 cols * self.CW, 3)
+        px = self.atlas.compose(self.atlas.ids(ramp)[idx], col)
         frame = np.zeros((self.h, self.w, 3), np.float32)
         frame[:px.shape[0], :px.shape[1]] = px
         self._status(frame, status)
@@ -326,16 +367,172 @@ class FbOut:
     def _status(self, frame, text):
         y0 = self.rows * self.CH
         frame[y0:, :] = 205.0
-        ids = [self.glyph_id.get(c, 0) for c in text[: self.cols]]
+        ids = [self.atlas.glyph_id.get(c, 0) for c in text[: self.cols]]
         if not ids:
             return
-        strip = self.atlas[np.array(ids)].transpose(1, 0, 2).reshape(
+        strip = self.atlas.a[np.array(ids)].transpose(1, 0, 2).reshape(
             self.CH, -1)[:, : self.w, None]
         frame[y0:y0 + self.CH, : strip.shape[1]] = (
             205.0 * (1 - strip) + 20.0 * strip)
 
     def close(self):
         self.f.close()
+
+
+# ---------- capture ----------
+
+SAVE_DIR = os.path.expanduser("~/Pictures/asciicam")
+_snap_atlas = None
+
+
+def save_path(prefix, ext):
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    return os.path.join(
+        SAVE_DIR, "%s-%s%s" % (prefix, time.strftime("%Y%m%d-%H%M%S"), ext))
+
+
+def snapshot(idx, rgb, st, frame):
+    """Save the moment: plain .txt, coloured .ans, a 2x-rendered .png of
+    the ASCII art, and the raw camera frame as .jpg."""
+    global _snap_atlas
+    base = save_path("ascii", "")
+    plain = "\n".join("".join(r) for r in RAMP_CHARS[st["ramp"]][idx])
+    with open(base + ".txt", "w", encoding="utf-8") as f:
+        f.write(plain + "\n")
+    if rgb is not None:
+        with open(base + ".ans", "w", encoding="utf-8") as f:
+            f.write("\x1b[2J\x1b[H" + ansi_full(idx, rgb, st) + "\n")
+    try:
+        from PIL import Image
+        if _snap_atlas is None:
+            _snap_atlas = GlyphAtlas(12, 20)
+        px = _snap_atlas.compose(
+            _snap_atlas.ids(RAMPS[st["ramp"]])[idx],
+            None if rgb is None else rgb * 255.0)
+        Image.fromarray(px.astype(np.uint8)).save(base + ".png")
+        pic = frame
+        if st["vflip"]:
+            pic = pic[::-1]
+        if st["mirror"]:
+            pic = pic[:, ::-1]
+        Image.fromarray(np.ascontiguousarray(pic)).save(
+            base + "-raw.jpg", quality=90)
+    except Exception:
+        return "saved %s (.txt only, PIL missing)" % os.path.basename(base)
+    return "saved " + os.path.basename(base) + ".*"
+
+
+class CastRecorder:
+    """asciinema v2 recording of full ANSI frames."""
+
+    def __init__(self, path, cols, rows):
+        self.path = path
+        self.f = open(path, "w", encoding="utf-8")
+        self.t0 = time.time()
+        self.f.write(json.dumps(
+            {"version": 2, "width": cols, "height": rows,
+             "timestamp": int(self.t0),
+             "env": {"TERM": "xterm-256color"}}) + "\n")
+        self.write("\x1b[2J\x1b[?25l")
+
+    def write(self, s):
+        self.f.write(json.dumps(
+            [round(time.time() - self.t0, 4), "o", s]) + "\n")
+
+    def frame(self, idx, rgb, st):
+        self.write("\x1b[H" + ansi_full(idx, rgb, st))
+
+    def close(self):
+        self.write("\x1b[0m\x1b[?25h")
+        self.f.close()
+
+
+def parse_ansi_frame(s, cols, rows, chars, col):
+    """Replay one of OUR recorded frames (cursor home, CRLF, SGR 0/38;5/
+    38;2) onto the given char and colour grids."""
+    cube = (0, 95, 135, 175, 215, 255)
+    x = y = 0
+    cur = (230.0, 230.0, 230.0)
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == "\x1b":
+            m = re.match(r"\x1b\[([0-9;]*)([A-Za-z])", s[i:])
+            if not m:
+                i += 1
+                continue
+            args, fin = m.group(1), m.group(2)
+            if fin == "H":
+                p = args.split(";")
+                y = int(p[0]) - 1 if p[0] else 0
+                x = int(p[1]) - 1 if len(p) > 1 and p[1] else 0
+            elif fin == "m":
+                p = [int(v) for v in args.split(";") if v] or [0]
+                if p[0] == 0:
+                    cur = (230.0, 230.0, 230.0)
+                elif p[:2] == [38, 5] and len(p) > 2 and p[2] >= 16:
+                    v = p[2] - 16
+                    cur = (cube[v // 36], cube[v // 6 % 6], cube[v % 6])
+                elif p[:2] == [38, 2] and len(p) > 4:
+                    cur = tuple(float(v) for v in p[2:5])
+            i += m.end()
+            continue
+        if c == "\r":
+            x = 0
+        elif c == "\n":
+            y += 1
+        else:
+            if 0 <= y < rows and 0 <= x < cols:
+                chars[y][x] = c
+                col[y][x] = cur
+            x += 1
+        i += 1
+
+
+def render_cast(path, out, fps_out=15.0):
+    """Offline: rasterize a recording made by this program into a video
+    file via ffmpeg."""
+    if not shutil.which("ffmpeg"):
+        sys.exit("ffmpeg not found - sudo apt install ffmpeg")
+    import subprocess
+    lines = open(path, encoding="utf-8").read().splitlines()
+    head = json.loads(lines[0])
+    cols, rows = head["width"], head["height"]
+    events = []
+    for ln in lines[1:]:
+        t, kind, s = json.loads(ln)
+        if kind == "o" and "\x1b[H" in s:
+            events.append((t, s))
+    if not events:
+        sys.exit("no frames in %s" % path)
+    atlas = GlyphAtlas(12, 20)
+    w, h = cols * atlas.cw, rows * atlas.ch
+    ff = subprocess.Popen(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo",
+         "-pix_fmt", "rgb24", "-s", "%dx%d" % (w, h),
+         "-r", "%g" % fps_out, "-i", "-", "-pix_fmt", "yuv420p", out],
+        stdin=subprocess.PIPE)
+    chars = [[" "] * cols for _ in range(rows)]
+    col = [[(230.0, 230.0, 230.0)] * cols for _ in range(rows)]
+    fi, img = -1, None
+    t, end = events[0][0], events[-1][0] + 1.0 / fps_out
+    while t <= end:
+        nfi = fi
+        while nfi + 1 < len(events) and events[nfi + 1][0] <= t:
+            nfi += 1
+        if nfi != fi:
+            fi = max(nfi, 0)
+            parse_ansi_frame(events[fi][1], cols, rows, chars, col)
+            gids = np.array([[atlas.glyph_id.get(c, 0) for c in row]
+                             for row in chars])
+            px = atlas.compose(gids, np.array(col, np.float32))
+            img = px.astype(np.uint8).tobytes()
+        ff.stdin.write(img)
+        t += 1.0 / fps_out
+    ff.stdin.close()
+    if ff.wait():
+        sys.exit("ffmpeg failed")
+    print("wrote %s (%dx%d, %d source frames)" % (out, w, h, len(events)))
 
 
 # ---------- terminal ----------
@@ -360,7 +557,16 @@ def main():
     ap.add_argument("--fb", action="store_true",
                     help="draw straight to the LCD framebuffer "
                          "(/dev/fb_lcd) instead of the terminal")
+    ap.add_argument("--render", metavar="CAST",
+                    help="rasterize a .cast recording to video and exit")
+    ap.add_argument("--out", help="output file for --render "
+                                  "(default: <cast>.mp4)")
     args = ap.parse_args()
+    if args.render:
+        render_cast(args.render,
+                    args.out or re.sub(r"\.cast$", "", args.render)
+                    + ".mp4")
+        return
     size = tuple(int(v) for v in args.size.lower().split("x"))
 
     src, name = open_source(args.source, size)
@@ -378,7 +584,7 @@ def main():
     interactive = sys.stdin.isatty()
     old = termios.tcgetattr(sys.stdin) if interactive else None
     out = sys.stdout
-    msg, n, fps = "", 0, 0.0
+    msg, n, fps, rec = "", 0, 0.0, None
     win_n, win_t0 = 0, time.time()
     try:
         if interactive:
@@ -393,17 +599,19 @@ def main():
                 cols, lines = shutil.get_terminal_size((53, 17))
                 rows = max(1, lines - 1)
             st["frame_i"] = n
-            status = (" %s %4.1ffps ramp%d g%.1f %s" % (
-                name, fps, st["ramp"], st["gamma"], msg))[:cols].ljust(cols)
+            status = (" %s %4.1ffps ramp%d g%.1f%s %s" % (
+                name, fps, st["ramp"], st["gamma"],
+                " REC" if rec else "", msg))[:cols].ljust(cols)
+            frame = src.read()
+            small, idx = cell_grid(frame, cols, rows, st)
+            rgb = cell_colour(small, st)
+            if rec is not None:
+                rec.frame(idx, rgb, st)
             if fb is not None:
-                small, idx = cell_grid(src.read(), cols, rows, st)
-                rgb = cell_colour(small, st)
                 fb.show(idx, None if rgb is None else rgb * 255.0,
                         RAMPS[st["ramp"]], status)
-                plain = None  # built on demand when saving
             else:
-                upd, plain = render(src.read(), cols, rows, st)
-                idx = None
+                upd, plain = render(idx, rgb, cols, rows, st)
                 if status != last_status or st["full"]:
                     upd += "\x1b[%d;1H\x1b[0;7m%s\x1b[0m" % (rows + 1,
                                                             status)
@@ -433,13 +641,16 @@ def main():
             elif k == "]":
                 st["gamma"] = min(3.0, round(st["gamma"] + 0.1, 1))
             elif k == "s":
-                if plain is None:
-                    plain = ["".join(r)
-                             for r in RAMP_CHARS[st["ramp"]][idx]]
-                fn = time.strftime("ascii-%Y%m%d-%H%M%S.txt")
-                with open(fn, "w", encoding="utf-8") as f:
-                    f.write("\n".join(plain) + "\n")
-                msg = "saved " + fn
+                msg = snapshot(idx, rgb, st, frame)
+            elif k == "v":
+                if rec is None:
+                    rec = CastRecorder(save_path("rec", ".cast"),
+                                       cols, rows)
+                    msg = "recording " + os.path.basename(rec.path)
+                else:
+                    rec.close()
+                    msg = "saved " + os.path.basename(rec.path)
+                    rec = None
             if k and k != "s":
                 st["pchars"] = None  # mode changed: full repaint
                 if k in "fm":
@@ -461,6 +672,8 @@ def main():
         pass
     finally:
         src.close()
+        if rec is not None:
+            rec.close()
         if fb is not None:
             fb.close()
         if old is not None:

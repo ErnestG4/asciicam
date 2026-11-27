@@ -2,7 +2,7 @@
   "app_name": "AsciiCam",
   "store": {
     "summary": "Live camera feed as ASCII art in the terminal, with colour and edge modes",
-    "description": "AsciiCam renders the camera feed as ASCII art in any terminal — on the device LCD console or over SSH — and the character grid follows the terminal size. Cycle through four character ramps, toggle truecolour, edge detection, flipping and inversion, tune gamma with [ and ], and save any frame to a text file with s. Works with the built-in CSI camera via picamera2, any V4L2/USB webcam via OpenCV, or a synthetic test pattern when no camera is available (--source test).",
+    "description": "AsciiCam renders the camera feed as live ASCII art. On the device it draws straight to the LCD framebuffer for full-speed colour; over SSH it renders in any terminal, following the terminal size. Cycle through four character ramps, toggle colour, edge detection, flipping and inversion, and tune gamma. Snapshot a moment with s (plain text, coloured ANSI, a rendered PNG of the art, and the raw photo as JPEG, saved to ~/Pictures/asciicam) or record ASCII video with v as an asciinema .cast, renderable to MP4 on-device with --render. Works with the built-in CSI camera via picamera2, any V4L2/USB webcam via OpenCV, or a synthetic test pattern (--source test).",
     "categories": [
       "Media"
     ],
